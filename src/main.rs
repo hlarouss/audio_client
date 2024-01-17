@@ -4,14 +4,31 @@ use std::io;
 use std::path;
 use std::fs;
 use hound;
+use serde_json::to_writer;
+use std::io::BufReader;
+use serde::{Deserialize, Serialize};
 
-//Constants
-const SAMPLE_RATE:u32 = 48000;
+#[derive(Serialize, Deserialize)]
+enum Command {
+    PerformRecording,
+    SendFilesList,
+    SendFileSpecs,
+    SendFile,
+}
+#[derive(Serialize, Deserialize)]
+struct WavSpecs {
+    channels: u16,
+    sample_rate: u32,
+    bits_per_sample: u16,
+    samples_amount: u32
+}
 
-/*
-"SEND_WAV_FILE"
-"RECORD_AND_SEND"
-*/
+#[derive(Serialize, Deserialize)]
+struct ClientRequest {
+    command: Command,
+    filename: String,
+}
+
 
 fn bytes_to_audio(audio_bytes_buffer:[u8;(i16::MAX as usize *2) as usize]) -> [i16;i16::MAX as usize] {
     let mut audio_buffer : [i16;i16::MAX as usize] = [0;i16::MAX as usize];
@@ -31,14 +48,14 @@ fn tcp_receive_chunk(mut stream: &TcpStream) -> std::io::Result<[i16;i16::MAX as
     Ok(bytes_to_audio(audio_bytes_buffer))
 }
 
-fn tcp_write_wav_file<P: AsRef<path::Path>>(stream: &TcpStream, filename: P, samples_amount: i64) -> io::Result<()> {
+fn tcp_receive_wav_file<P: AsRef<path::Path>>(stream: &TcpStream, filename: P, wave_file_specs: WavSpecs) -> io::Result<()> {
 
-    let mut samples_left : i64 = samples_amount;
+    let mut samples_left : i64 = wave_file_specs.samples_amount as i64;
 
     let spec: hound::WavSpec = hound::WavSpec {
-        channels: 2,
-        sample_rate: SAMPLE_RATE,
-        bits_per_sample: 16,
+        channels: wave_file_specs.channels,
+        sample_rate: wave_file_specs.sample_rate,
+        bits_per_sample: wave_file_specs.bits_per_sample,
         sample_format: hound::SampleFormat::Int,
     };
 
@@ -67,22 +84,61 @@ fn tcp_write_wav_file<P: AsRef<path::Path>>(stream: &TcpStream, filename: P, sam
     Ok(())
 }
 
+fn tcp_stream_to_vec(stream: TcpStream) -> std::io::Result<Vec<u8>>{
+    let stream_clone: TcpStream = stream.try_clone()?;
+
+    let mut data: Vec<u8> = Vec::new();
+    let mut stream_buff: BufReader<_> = BufReader::new(stream_clone);
+
+    let bytes_read: usize = stream_buff.read_until(b'}', &mut data)?;
+    println!("Bytes read: {}", bytes_read);
+
+    Ok(data)
+}
+
+fn tcp_stream_to_wav_file_specs(stream: TcpStream) -> std::io::Result<WavSpecs>{
+
+    let json_raw_data: Vec<u8> = tcp_stream_to_vec(stream)?;
+
+    let wav_file_specs: WavSpecs = serde_json::from_slice(&json_raw_data)?;
+
+    Ok(wav_file_specs)
+}
+
 fn main() -> std::io::Result<()> {
-    let mut stream: TcpStream = TcpStream::connect("127.0.0.1:8000")?;
+    let stream: TcpStream = TcpStream::connect("127.0.0.1:8000")?;
 
-    let mut samples_amount_bytes: [u8;4] = [0;4];
-    stream.write(b"SEND_WAV_FILE")?;
-    stream.read_exact(&mut samples_amount_bytes)?;
+    //Get file specs
+    let client_request: ClientRequest = ClientRequest {
+        command : Command::SendFileSpecs,
+        filename : "target/prerecorded2.wav".to_string(),
+    };
 
-    let samples_amount: u32 =   ((samples_amount_bytes[0] as u32) << 24) | 
-                                ((samples_amount_bytes[1] as u32) << 16) | 
-                                ((samples_amount_bytes[2] as u32) << 8) | 
-                                ((samples_amount_bytes[3] as u32));
+    let specs_string = serde_json::to_string(&client_request)?;
+    println!("{}", specs_string);
 
-    println!("Amount of samples: {}", samples_amount);
+    let stream_clone = stream.try_clone().expect("clone failed...");
 
-    
-    tcp_write_wav_file(&stream,"target/received_audio.wav",samples_amount as i64)?;
+    to_writer(stream_clone,&client_request)?;
+
+    let stream_clone: TcpStream = stream.try_clone()?;
+    let wav_file_specs: WavSpecs = tcp_stream_to_wav_file_specs(stream_clone)?;
+
+
+    let wav_file_specs_string: String = serde_json::to_string(&wav_file_specs)?;
+    println!("{}", wav_file_specs_string);
+
+    let stream: TcpStream = TcpStream::connect("127.0.0.1:8000")?;
+
+    //Get file
+    let client_request: ClientRequest = ClientRequest {
+        command : Command::SendFile,
+        filename : "target/prerecorded2.wav".to_string(),
+    };
+
+    to_writer(&stream,&client_request)?;
+
+    tcp_receive_wav_file(&stream,client_request.filename,wav_file_specs)?;
 
     Ok(())
 } // the stream is closed here
