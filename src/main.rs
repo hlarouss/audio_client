@@ -85,24 +85,6 @@ struct FilesList {
     files: Vec<String>,
 }
 
-fn bytes_to_audio(audio_bytes_buffer:[u8;(i16::MAX as usize *2) as usize]) -> [i16;i16::MAX as usize] {
-    let mut audio_buffer : [i16;i16::MAX as usize] = [0;i16::MAX as usize];
-
-    for i in 0..audio_buffer.len() {
-        audio_buffer[i] = ((audio_bytes_buffer[i*2] as i16) << 8) | (audio_bytes_buffer[i*2 + 1] as i16);
-    }
-
-    return audio_buffer;
-}
-
-fn tcp_receive_chunk(mut stream: &TcpStream) -> std::io::Result<[i16;i16::MAX as usize]>{
-    let mut audio_bytes_buffer: [u8;(i16::MAX as usize *2) as usize] = [0;(i16::MAX as usize *2) as usize];
-
-    stream.read_exact(&mut audio_bytes_buffer)?;
-
-    Ok(bytes_to_audio(audio_bytes_buffer))
-}
-
 fn tcp_receive_bytes_chunk(mut stream: &TcpStream) -> std::io::Result<[u8;BYTE_BUFFER_SIZE]>{
     let mut audio_bytes_buffer: [u8;BYTE_BUFFER_SIZE] = [0;BYTE_BUFFER_SIZE];
 
@@ -223,82 +205,46 @@ fn tcp_receive_wav_file<P: AsRef<path::Path>>(stream: TcpStream, filename: P, wa
     let spec: hound::WavSpec = wav_spec_from_wav_file_specs(wave_file_specs)?;
 
     let mut writer: hound::WavWriter<io::BufWriter<fs::File>> = hound::WavWriter::create(filename, spec).unwrap();
+
+    while samples_left > 0 {
+        let audio_bytes_buffer = tcp_receive_bytes_chunk(&stream)?;
+
+        let samples_to_write = if (samples_left - (samples_per_buffer as i64))> 0 {samples_per_buffer} else {samples_left as usize};
+
+        if spec.sample_format ==  hound::SampleFormat::Float {
+            let audio_samples_buffer = bytes_buffer_to_f32(audio_bytes_buffer);
+            for audio_sample_index in 0..samples_to_write as usize {
+                writer.write_sample(audio_samples_buffer[audio_sample_index]).unwrap();
+            }
+        }
+        else {
+            match sample_bytes_size {
+                I8_SIZE => {
+                    let audio_samples_buffer = bytes_buffer_to_i8(audio_bytes_buffer);
+                    for audio_sample_index in 0..samples_to_write as usize {
+                        writer.write_sample(audio_samples_buffer[audio_sample_index]).unwrap();
+                    }
+                },
+                I16_SIZE => {
+                    let audio_samples_buffer = bytes_buffer_to_i16(audio_bytes_buffer);
+                    for audio_sample_index in 0..samples_to_write as usize {
+                        writer.write_sample(audio_samples_buffer[audio_sample_index]).unwrap();
+                    }
+                },
+                I32_SIZE => {
+                    let audio_samples_buffer = bytes_buffer_to_i32(audio_bytes_buffer);
+                    for audio_sample_index in 0..samples_to_write as usize {
+                        writer.write_sample(audio_samples_buffer[audio_sample_index]).unwrap();
+                    }
+                },
+                _ => {panic!("Unsupported wav file format!")},
+            }
+        }
+
+        samples_left = samples_left - (samples_to_write as i64);
+
+    }
     
-    while  (samples_left - (samples_per_buffer as i64))> 0 {
-
-        let audio_bytes_buffer = tcp_receive_bytes_chunk(&stream)?;
-
-        //write_bytes_buffer_to_file(*caca,audio_bytes_buffer,samples_per_buffer,spec.sample_format,sample_bytes_size)?;
-        
-        if spec.sample_format ==  hound::SampleFormat::Float {
-            let f32_buffer = bytes_buffer_to_f32(audio_bytes_buffer);
-            for val in f32_buffer.into_iter() {
-                writer.write_sample(val).unwrap();
-            }
-        }
-        else {
-            match sample_bytes_size {
-                1 => {
-                    let i8_buffer = bytes_buffer_to_i8(audio_bytes_buffer);
-                    for val in i8_buffer.into_iter() {
-                        writer.write_sample(val).unwrap();
-                    }
-                },
-                2 => {
-                    let i16_buffer = bytes_buffer_to_i16(audio_bytes_buffer);
-                    for val in i16_buffer.into_iter() {
-                        writer.write_sample(val).unwrap();
-                    }
-                },
-                4 => {
-                    let i32_buffer = bytes_buffer_to_i32(audio_bytes_buffer);
-                    for val in i32_buffer.into_iter() {
-                        writer.write_sample(val).unwrap();
-                    }
-                },
-                _ => {panic!("Unsupported wav file format!")},
-            }
-        }
-
-        samples_left = samples_left - (samples_per_buffer as i64);
-    }
-    //Process last batch if applicable
-    if samples_left > 0 {
-        let audio_bytes_buffer = tcp_receive_bytes_chunk(&stream)?;
-
-        if spec.sample_format ==  hound::SampleFormat::Float {
-            let f32_buffer = bytes_buffer_to_f32(audio_bytes_buffer);
-            for i in 0..samples_left as usize {
-                writer.write_sample(f32_buffer[i]).unwrap();
-            }
-        }
-        else {
-            match sample_bytes_size {
-                1 => {
-                    let i8_buffer = bytes_buffer_to_i8(audio_bytes_buffer);
-                    for i in 0..samples_left as usize {
-                        writer.write_sample(i8_buffer[i]).unwrap();
-                    }
-                },
-                2 => {
-                    let i16_buffer = bytes_buffer_to_i16(audio_bytes_buffer);
-                    for i in 0..samples_left as usize {
-                        writer.write_sample(i16_buffer[i]).unwrap();
-                    }
-                },
-                4 => {
-                    let i32_buffer = bytes_buffer_to_i32(audio_bytes_buffer);
-                    for i in 0..samples_left as usize {
-                        writer.write_sample(i32_buffer[i]).unwrap();
-                    }
-                },
-                _ => {panic!("Unsupported wav file format!")},
-            }
-        }
-
-        //write_bytes_buffer_to_file(writer,audio_bytes_buffer,(samples_left as usize),spec.sample_format,sample_bytes_size)?;
-    }
-
     writer.finalize().unwrap();
 
     Ok(())
@@ -404,10 +350,9 @@ fn main() -> std::io::Result<()> {
     //Get file list
     let stream: TcpStream = TcpStream::connect("127.0.0.1:8000")?;
 
-    //let stream_clone = stream.try_clone()?;
-    //tcp_send_client_request(stream, Command::PerformRecording,  "".to_string())?;
+    tcp_send_client_request(stream, Command::PerformRecording,  "".to_string())?;
 
-    //let stream: TcpStream = TcpStream::connect("127.0.0.1:8000")?;
+    let stream: TcpStream = TcpStream::connect("127.0.0.1:8000")?;
 
     let stream_clone = stream.try_clone()?;
     tcp_send_client_request(stream_clone, Command::SendFilesList,  "".to_string())?;
