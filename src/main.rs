@@ -7,6 +7,16 @@ use hound;
 use serde_json::to_writer;
 use std::io::BufReader;
 use serde::{Deserialize, Serialize};
+use cpal;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use dasp_signal::{self, Signal};
+use dasp_slice::ToFrameSliceMut;
+
+const BYTE_BUFFER_SIZE: usize = (u16::MAX as usize) + (1 as usize);
+const I8_SIZE : usize = 1;
+const I16_SIZE : usize = 2;
+const I32_SIZE : usize = 4;
+const F32_SIZE : usize = 4;
 
 #[derive(Serialize, Deserialize)]
 enum Command {
@@ -15,12 +25,53 @@ enum Command {
     SendFileSpecs,
     SendFile,
 }
+
 #[derive(Serialize, Deserialize)]
-struct WavSpecs {
+pub enum SampleFormat {
+    Float,
+    Int,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WavFileSpecs {
     channels: u16,
     sample_rate: u32,
     bits_per_sample: u16,
-    samples_amount: u32
+    sample_format: SampleFormat,
+    samples_amount: u32,
+}
+
+fn wav_spec_from_wav_file_specs(wav_file_specs: WavFileSpecs) -> std::io::Result<hound::WavSpec> {
+
+    let sample_format: hound::SampleFormat = match wav_file_specs.sample_format {
+        SampleFormat::Float => hound::SampleFormat::Float,
+        SampleFormat::Int => hound::SampleFormat::Int,
+        _ => {panic!("Unvalid WavFileSpecs sample format!");},
+    };
+
+    Ok(hound::WavSpec {
+        channels: wav_file_specs.channels,
+        sample_rate: wav_file_specs.sample_rate,
+        bits_per_sample: wav_file_specs.bits_per_sample,
+        sample_format: sample_format,
+    })
+}
+
+fn wav_file_specs_from_wav_spec(wav_spec: hound::WavSpec, samples_amount: u32) -> std::io::Result<WavFileSpecs> {
+
+    let sample_format: SampleFormat = match wav_spec.sample_format {
+        hound::SampleFormat::Float => SampleFormat::Float,
+        hound::SampleFormat::Int => SampleFormat::Int ,
+        _ => {panic!("Unvalid WavFileSpecs sample format!");},
+    };
+
+    Ok(WavFileSpecs  {
+        channels: wav_spec.channels,
+        sample_rate: wav_spec.sample_rate,
+        bits_per_sample: wav_spec.bits_per_sample,
+        sample_format,
+        samples_amount,
+    })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -52,35 +103,200 @@ fn tcp_receive_chunk(mut stream: &TcpStream) -> std::io::Result<[i16;i16::MAX as
     Ok(bytes_to_audio(audio_bytes_buffer))
 }
 
-fn tcp_receive_wav_file<P: AsRef<path::Path>>(stream: TcpStream, filename: P, wave_file_specs: WavSpecs) -> io::Result<()> {
+fn tcp_receive_bytes_chunk(mut stream: &TcpStream) -> std::io::Result<[u8;BYTE_BUFFER_SIZE]>{
+    let mut audio_bytes_buffer: [u8;BYTE_BUFFER_SIZE] = [0;BYTE_BUFFER_SIZE];
 
-    let mut samples_left : i64 = wave_file_specs.samples_amount as i64;
+    stream.read_exact(&mut audio_bytes_buffer)?;
 
-    let spec: hound::WavSpec = hound::WavSpec {
-        channels: wave_file_specs.channels,
-        sample_rate: wave_file_specs.sample_rate,
-        bits_per_sample: wave_file_specs.bits_per_sample,
-        sample_format: hound::SampleFormat::Int,
-    };
+    Ok(audio_bytes_buffer)
+}
 
-    let mut writer: hound::WavWriter<io::BufWriter<fs::File>> = hound::WavWriter::create(filename, spec).unwrap();
+fn bytes_buffer_to_i8(audio_bytes_buffer: [u8;BYTE_BUFFER_SIZE]) -> [i8;BYTE_BUFFER_SIZE]{
+    let mut audio_buffer : [i8;BYTE_BUFFER_SIZE/I8_SIZE] = [0;BYTE_BUFFER_SIZE/I8_SIZE];
 
-    while  samples_left - (i16::MAX as i64) > 0 {
-        let audio_buffer: [i16;i16::MAX as usize] = tcp_receive_chunk(&stream)?;
+    for audio_buffer_index in 0..audio_buffer.len() {
+        let index = audio_buffer_index * I8_SIZE;
+        audio_buffer[audio_buffer_index]  = audio_bytes_buffer[index] as i8;
+    }
 
-        for val in audio_buffer.into_iter() {
+    return audio_buffer;
+}
+
+fn bytes_buffer_to_i16(audio_bytes_buffer: [u8;BYTE_BUFFER_SIZE]) -> [i16;BYTE_BUFFER_SIZE/I16_SIZE]{
+    let mut audio_buffer : [i16;BYTE_BUFFER_SIZE/I16_SIZE] = [0;BYTE_BUFFER_SIZE/I16_SIZE];
+
+    for audio_buffer_index in 0..audio_buffer.len() {
+        let index = audio_buffer_index * I16_SIZE;
+        audio_buffer[audio_buffer_index] = ((audio_bytes_buffer[index] as i16) << 8)
+                                            | (audio_bytes_buffer[index + 1] as i16);
+    }
+
+    return audio_buffer;
+}
+
+fn bytes_buffer_to_i32(audio_bytes_buffer: [u8;BYTE_BUFFER_SIZE]) -> [i32;BYTE_BUFFER_SIZE/I32_SIZE]{
+    let mut audio_buffer : [i32;BYTE_BUFFER_SIZE/I32_SIZE] = [0;BYTE_BUFFER_SIZE/I32_SIZE];
+
+    for audio_buffer_index in 0..audio_buffer.len() {
+        let index = audio_buffer_index * I32_SIZE;
+        audio_buffer[audio_buffer_index] = ((audio_bytes_buffer[index] as i32) << 24)
+                                            | ((audio_bytes_buffer[index + 1] as i32) << 16)
+                                            | ((audio_bytes_buffer[index + 2] as i32) << 8)
+                                            | (audio_bytes_buffer[index + 3] as i32);
+    }
+
+    return audio_buffer;
+}
+
+fn bytes_buffer_to_f32(audio_bytes_buffer: [u8;BYTE_BUFFER_SIZE]) -> [f32;BYTE_BUFFER_SIZE/F32_SIZE]{
+    let mut audio_buffer : [f32;BYTE_BUFFER_SIZE/F32_SIZE] = [0.0;BYTE_BUFFER_SIZE/F32_SIZE];
+
+    for audio_buffer_index in 0..audio_buffer.len() {
+        let index = audio_buffer_index * F32_SIZE;
+        audio_buffer[audio_buffer_index] = f32::from_be_bytes([audio_bytes_buffer[index],
+                                            audio_bytes_buffer[index + 1],
+                                            audio_bytes_buffer[index + 2],
+                                            audio_bytes_buffer[index + 3]
+                                            ]);
+    }
+
+    return audio_buffer;
+}
+
+fn write_bytes_buffer_to_file(mut writer: hound::WavWriter<io::BufWriter<fs::File>>, 
+                                audio_bytes_buffer: [u8;BYTE_BUFFER_SIZE], 
+                                samples_to_write: usize,
+                                sample_format: hound::SampleFormat,
+                                sample_bytes_size: usize) -> io::Result<()> {
+                                    
+    if sample_format ==  hound::SampleFormat::Float {
+        for audio_buffer_index in 0..samples_to_write {
+            let index = audio_buffer_index * sample_bytes_size;
+            let val = f32::from_be_bytes([audio_bytes_buffer[index],
+                                audio_bytes_buffer[index + 1],
+                                audio_bytes_buffer[index + 2],
+                                audio_bytes_buffer[index + 3]
+                                ]);
             writer.write_sample(val).unwrap();
         }
+    }
+    else {
+        match sample_bytes_size {
+            1 => {
+                for audio_buffer_index in 0..samples_to_write {
+                    let index = audio_buffer_index * sample_bytes_size;
+                    let val = audio_bytes_buffer[index] as i8;
+                    writer.write_sample(val).unwrap();
+                }
+            },
+            2 => {
+                for audio_buffer_index in 0..samples_to_write {
+                    let index = audio_buffer_index * sample_bytes_size;
+                    let val = ((audio_bytes_buffer[index] as i16) << 8)
+                                    | (audio_bytes_buffer[index + 1] as i16);
+                    writer.write_sample(val).unwrap();
+                }
+            },
+            4 => {
+                for audio_buffer_index in 0..samples_to_write {
+                    let index = audio_buffer_index * sample_bytes_size;
+                    let val = ((audio_bytes_buffer[index] as i32) << 24)
+                                    | ((audio_bytes_buffer[index + 1] as i32) << 16)
+                                    | ((audio_bytes_buffer[index + 2] as i32) << 8)
+                                    | (audio_bytes_buffer[index + 3] as i32);
+                    writer.write_sample(val).unwrap();
+                }
+            },
+            _ => {panic!("Unsupported wav file format!")},
+        }
+    }
 
-        samples_left = samples_left - (i16::MAX as i64);
+    Ok(())
+}
+
+fn tcp_receive_wav_file<P: AsRef<path::Path>>(stream: TcpStream, filename: P, wave_file_specs: WavFileSpecs) -> io::Result<()> {
+
+    let mut samples_left : i64 = wave_file_specs.samples_amount as i64;
+    let sample_bytes_size: usize = (wave_file_specs.bits_per_sample/8) as usize;
+    let samples_per_buffer: usize = BYTE_BUFFER_SIZE / sample_bytes_size;
+
+    let spec: hound::WavSpec = wav_spec_from_wav_file_specs(wave_file_specs)?;
+
+    let mut writer: hound::WavWriter<io::BufWriter<fs::File>> = hound::WavWriter::create(filename, spec).unwrap();
+    
+    while  (samples_left - (samples_per_buffer as i64))> 0 {
+
+        let audio_bytes_buffer = tcp_receive_bytes_chunk(&stream)?;
+
+        //write_bytes_buffer_to_file(*caca,audio_bytes_buffer,samples_per_buffer,spec.sample_format,sample_bytes_size)?;
+        
+        if spec.sample_format ==  hound::SampleFormat::Float {
+            let f32_buffer = bytes_buffer_to_f32(audio_bytes_buffer);
+            for val in f32_buffer.into_iter() {
+                writer.write_sample(val).unwrap();
+            }
+        }
+        else {
+            match sample_bytes_size {
+                1 => {
+                    let i8_buffer = bytes_buffer_to_i8(audio_bytes_buffer);
+                    for val in i8_buffer.into_iter() {
+                        writer.write_sample(val).unwrap();
+                    }
+                },
+                2 => {
+                    let i16_buffer = bytes_buffer_to_i16(audio_bytes_buffer);
+                    for val in i16_buffer.into_iter() {
+                        writer.write_sample(val).unwrap();
+                    }
+                },
+                4 => {
+                    let i32_buffer = bytes_buffer_to_i32(audio_bytes_buffer);
+                    for val in i32_buffer.into_iter() {
+                        writer.write_sample(val).unwrap();
+                    }
+                },
+                _ => {panic!("Unsupported wav file format!")},
+            }
+        }
+
+        samples_left = samples_left - (samples_per_buffer as i64);
     }
     //Process last batch if applicable
     if samples_left > 0 {
-        let audio_buffer: [i16;i16::MAX as usize] = tcp_receive_chunk(&stream)?;
+        let audio_bytes_buffer = tcp_receive_bytes_chunk(&stream)?;
 
-        for i in 0..samples_left as usize {
-            writer.write_sample(audio_buffer[i]).unwrap();
+        if spec.sample_format ==  hound::SampleFormat::Float {
+            let f32_buffer = bytes_buffer_to_f32(audio_bytes_buffer);
+            for i in 0..samples_left as usize {
+                writer.write_sample(f32_buffer[i]).unwrap();
+            }
         }
+        else {
+            match sample_bytes_size {
+                1 => {
+                    let i8_buffer = bytes_buffer_to_i8(audio_bytes_buffer);
+                    for i in 0..samples_left as usize {
+                        writer.write_sample(i8_buffer[i]).unwrap();
+                    }
+                },
+                2 => {
+                    let i16_buffer = bytes_buffer_to_i16(audio_bytes_buffer);
+                    for i in 0..samples_left as usize {
+                        writer.write_sample(i16_buffer[i]).unwrap();
+                    }
+                },
+                4 => {
+                    let i32_buffer = bytes_buffer_to_i32(audio_bytes_buffer);
+                    for i in 0..samples_left as usize {
+                        writer.write_sample(i32_buffer[i]).unwrap();
+                    }
+                },
+                _ => {panic!("Unsupported wav file format!")},
+            }
+        }
+
+        //write_bytes_buffer_to_file(writer,audio_bytes_buffer,(samples_left as usize),spec.sample_format,sample_bytes_size)?;
     }
 
     writer.finalize().unwrap();
@@ -100,11 +316,11 @@ fn tcp_stream_to_vec(stream: TcpStream) -> std::io::Result<Vec<u8>>{
     Ok(data)
 }
 
-fn tcp_stream_to_wav_file_specs(stream: TcpStream) -> std::io::Result<WavSpecs>{
+fn tcp_stream_to_wav_file_specs(stream: TcpStream) -> std::io::Result<WavFileSpecs>{
 
     let json_raw_data: Vec<u8> = tcp_stream_to_vec(stream)?;
 
-    let wav_file_specs: WavSpecs = serde_json::from_slice(&json_raw_data)?;
+    let wav_file_specs: WavFileSpecs = serde_json::from_slice(&json_raw_data)?;
 
     Ok(wav_file_specs)
 }
@@ -133,7 +349,58 @@ fn tcp_send_client_request(stream: TcpStream, command: Command, filename: String
     Ok(())
 }
 
+fn play_file() {
+    let reader = hound::WavReader::open("target/received.wav").unwrap();
+    let spec = reader.spec();
+
+    // Read the interleaved samples and convert them to a signal.
+    let samples = reader.into_samples::<i16>().filter_map(Result::ok);
+    let mut frames = dasp_signal::from_interleaved_samples_iter(samples).until_exhausted();
+
+    // Initialise CPAL.
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .expect("failed to find a default output device");
+
+    // Create a stream config to match the wave format.
+    let config = cpal::StreamConfig {
+        channels: spec.channels,
+        sample_rate: cpal::SampleRate(spec.sample_rate),
+        buffer_size: cpal::BufferSize::Default,
+    };
+
+    //debug
+    println!("Device: {:?}", device.name());
+    println!("Config: {:?}", config);
+
+    // A channel for indicating when playback has completed.
+    let (complete_tx, complete_rx) = std::sync::mpsc::sync_channel(1);
+
+    // Create and run the CPAL stream.
+    let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
+    let data_fn = move |data: &mut [i16], _info: &cpal::OutputCallbackInfo| {
+        let buffer: &mut [[i16; 2]] = data.to_frame_slice_mut().unwrap();
+        for out_frame in buffer {
+            match frames.next() {
+                Some(frame) => *out_frame = frame,
+                None => {
+                    complete_tx.try_send(()).ok();
+                    *out_frame = dasp::Frame::EQUILIBRIUM;
+                }
+            }
+        }
+    };
+    let stream = device.build_output_stream(&config, data_fn, err_fn, None).unwrap();
+    stream.play().unwrap();
+
+    // Block until playback completes.
+    complete_rx.recv().unwrap();
+    stream.pause().ok();
+}
+
 fn main() -> std::io::Result<()> {
+    //play_file();
     //Get file list
     let stream: TcpStream = TcpStream::connect("127.0.0.1:8000")?;
 
@@ -161,7 +428,7 @@ fn main() -> std::io::Result<()> {
     tcp_send_client_request(stream_clone, Command::SendFileSpecs,  filename.to_string())?;
 
     let stream_clone = stream.try_clone()?;
-    let wav_file_specs: WavSpecs = tcp_stream_to_wav_file_specs(stream_clone)?;
+    let wav_file_specs: WavFileSpecs = tcp_stream_to_wav_file_specs(stream_clone)?;
 
     let wav_file_specs_string: String = serde_json::to_string(&wav_file_specs)?;
     println!("{}", wav_file_specs_string);

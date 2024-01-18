@@ -6,6 +6,10 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+cpal = "0.15.2"
+dasp = "0.11.0"
+dasp_signal = "0.11.0"
+dasp_slice = "0.11.0"
 hound = "3.5.1"
 serde = { version = "1.0.195", features = ["derive"] }
 serde_json = "1.0.111"
