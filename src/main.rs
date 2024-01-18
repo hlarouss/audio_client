@@ -137,6 +137,11 @@ fn main() -> std::io::Result<()> {
     //Get file list
     let stream: TcpStream = TcpStream::connect("127.0.0.1:8000")?;
 
+    //let stream_clone = stream.try_clone()?;
+    //tcp_send_client_request(stream, Command::PerformRecording,  "".to_string())?;
+
+    //let stream: TcpStream = TcpStream::connect("127.0.0.1:8000")?;
+
     let stream_clone = stream.try_clone()?;
     tcp_send_client_request(stream_clone, Command::SendFilesList,  "".to_string())?;
 
@@ -147,7 +152,7 @@ fn main() -> std::io::Result<()> {
     println!("{}", files_list_string);
 
     //Choose file
-    let filename : &String = &files_list.files[1];
+    let filename : &String = &files_list.files[0];
 
     //Get file specs
     let stream: TcpStream = TcpStream::connect("127.0.0.1:8000")?;
